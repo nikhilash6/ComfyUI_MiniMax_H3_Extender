@@ -6,6 +6,28 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 
 ---
 
+### 🆕 Per-Clip Local References
+
+Ref2VA clips can now use their own **local Picture, Video and Audio references** in addition to the existing global references.
+
+Each clip gets a compact **Refs** panel where local references can be added, removed and previewed without cluttering the main card UI.
+
+Local references use the normal H3 slot numbering and share the same limits as global references:
+
+- up to **9 Pictures**
+- up to **3 Videos**
+- up to **3 Audio references**
+
+Global references remain global exactly as before. Local references simply use the next available slots for that clip.
+
+If a slot is already used locally, the matching global slot is automatically reserved to avoid conflicts. References coming from a Ref Pack are also handled safely without remapping or blocking generation.
+
+Local Pictures can be edited with the same image editor as global references, and local Video/Audio references include compact preview players directly inside the Refs panel.
+
+All local references are fully included in **Project Save/Load**, so they are restored automatically with the project.
+
+---
+
 ### 🆕 Full Batch: Interrupt, Save & Resume
 
 Full Batch workflows are now much safer and easier to manage.
