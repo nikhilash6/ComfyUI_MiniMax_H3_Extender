@@ -28,6 +28,7 @@ from .patch_motion_layout import (
 )
 from .patch_motion_payload import (
     apply_patch as _apply_payload_patch,
+    ensure_patch as _ensure_payload_patch,
     is_applied as _payload_patch_applied,
 )
 
@@ -58,6 +59,14 @@ def _native_guide_api_supported():
 
 
 def _ensure_patches():
+    # Do not trust another custom node's compatibility marker here.  Reassert
+    # our exact v2.6.0 payload patch immediately before Motion Context runs.
+    if not _ensure_payload_patch():
+        raise RuntimeError(
+            "MiniMax H3 Motion Context RAM: could not enforce the Extender "
+            "keyframe/reference payload patch. Check the ComfyUI log."
+        )
+
     if _native_guide_api_supported():
         return "native"
 

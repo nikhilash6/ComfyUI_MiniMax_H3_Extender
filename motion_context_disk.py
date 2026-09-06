@@ -3870,6 +3870,73 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             _LOG.exception("H3 full-batch interrupt request failed")
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
+    @PromptServer.instance.routes.post("/h3_extender/local_ref_invalidate")
+    async def h3_extender_local_ref_invalidate(request):
+        """Persist clip invalidation caused by a clip-local reference edit.
+
+        Local refs live in clips_json, but cache_state is restored from the disk
+        manifest after a browser refresh. Keep the manifest validation flags in
+        sync immediately so F5 cannot resurrect validations that the local-ref
+        edit already cleared in the serialized card state.
+        """
+        try:
+            body = await request.json()
+            owner_id = str(body.get("owner_id") or "").strip()
+            generation_mode = str(body.get("generation_mode") or "ref2va").lower()
+            clip_index = int(body.get("clip_index", -1))
+            clip_id = str(body.get("clip_id") or "").strip()
+            if not owner_id:
+                return web.json_response({"ok": False, "error": "Missing owner id."}, status=400)
+
+            if generation_mode == "fl2va":
+                # Local clip refs are currently Ref2VA-only, but keep this route
+                # harmless if a future UI calls it for FL2VA.
+                from .fl2va_engine import cache_owner_id
+                cache_owner = cache_owner_id(owner_id)
+            else:
+                cache_owner = f"extender_{_safe_name(owner_id)}"
+
+            data_path, manifest_path = _chain_paths(cache_owner)
+            manifest = _load_manifest_from_paths(data_path, manifest_path)
+            if manifest is None:
+                # No generated cache yet: clips_json is the only persistence
+                # source, so there is nothing on disk to invalidate.
+                return web.json_response({"ok": True, "found": False})
+
+            segments = [dict(x) for x in manifest.get("segments", [])]
+            if generation_mode == "fl2va":
+                if clip_id:
+                    started = False
+                    for desc in segments:
+                        if str(desc.get("clip_id") or "") == clip_id:
+                            started = True
+                        if started:
+                            desc["validated"] = False
+                elif 0 <= clip_index < len(segments):
+                    segments[clip_index]["validated"] = False
+            else:
+                if clip_index < 0:
+                    return web.json_response({"ok": False, "error": "Invalid clip index."}, status=400)
+                for i in range(min(clip_index, len(segments)), len(segments)):
+                    segments[i]["validated"] = False
+
+            manifest = dict(manifest)
+            manifest["segments"] = segments
+            manifest["updated_at"] = time.time()
+            _write_json_atomic(manifest_path, manifest)
+            return web.json_response({
+                "ok": True,
+                "found": True,
+                "validated_count": int(
+                    sum(bool(x.get("validated", False)) for x in segments)
+                    if generation_mode == "fl2va"
+                    else _validated_prefix_count(segments)
+                ),
+            })
+        except Exception as exc:
+            _LOG.exception("H3 local-ref validation invalidation failed")
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
     @PromptServer.instance.routes.post("/h3_extender/discard_computed")
     async def h3_extender_discard_computed(request):
         """Discard one resumable Full-Batch checkpoint without touching preview.

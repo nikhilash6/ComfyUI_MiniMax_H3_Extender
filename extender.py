@@ -19,12 +19,14 @@ import datetime as _datetime
 import hashlib
 import json
 import logging
+import mimetypes
 import math
 import os
 import re
 from pathlib import Path
 import secrets
 import shutil
+import subprocess
 import time
 import uuid
 import zipfile
@@ -71,6 +73,7 @@ from .motion_context_disk import (
     full_batch_interrupt_requested,
     cache_full_batch_ref2va_segment,
     normalize_full_batch_export_profile,
+    _find_ffmpeg,
     _resolve_full_batch_export_profile,
 )
 from .fl2va_engine import (
@@ -93,7 +96,7 @@ from .fl2va_engine import (
     cache_full_batch_fl2va_plan,
 )
 
-BUILD = "minimax-h3-extender-v2.5.16"
+BUILD = "minimax-h3-extender-v2.6.2"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
@@ -130,14 +133,16 @@ MAX_RESOLUTION = 4096
 DEFAULT_SEED_MAX = (1 << 53) - 1  # exact integer range in browser JS
 
 PROJECT_FORMAT = "MiniMax H3 Extender Project"
-PROJECT_FORMAT_VERSION = 2
-PROJECT_SUPPORTED_VERSIONS = {1, 2}
+PROJECT_FORMAT_VERSION = 3
+PROJECT_SUPPORTED_VERSIONS = {1, 2, 3}
 PROJECT_JSON_MAX_BYTES = 16 * 1024 * 1024
 PROJECT_DOWNLOAD_TTL_SECONDS = 2 * 60 * 60
 PROJECT_COPY_CHUNK = 8 * 1024 * 1024
 MAX_IMAGE_REFS = MAX_REFERENCE_SLOTS
 REFS_JSON_VERSION = 2
 MAX_REF_UPLOAD_BYTES = 256 * 1024 * 1024
+MAX_LOCAL_MEDIA_UPLOAD_BYTES = 512 * 1024 * 1024
+LOCAL_REFS_VERSION = 1
 MAX_REF_PIXELS = 120_000_000
 _PROJECT_DOWNLOADS = {}
 
@@ -234,6 +239,228 @@ def _ref_path(ref_id):
     if not _ref_id_is_safe(ref_id):
         raise ValueError("MiniMax H3 Extender: invalid internal reference id.")
     return _refs_root() / f"{ref_id}.png"
+
+
+def _local_media_root():
+    root = _ensure_cache_root() / "_local_media_refs"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _local_media_path(media_id):
+    media_id = str(media_id or "").lower().strip()
+    if not _ref_id_is_safe(media_id):
+        raise ValueError("MiniMax H3 Extender: invalid local media reference id.")
+    return _local_media_root() / f"{media_id}.bin"
+
+
+def _normalize_media_descriptor(value, expected_kind=None):
+    if not isinstance(value, dict):
+        return None
+    media_id = str(value.get("id") or value.get("media_id") or "").lower().strip()
+    if not _ref_id_is_safe(media_id):
+        return None
+    kind = str(value.get("kind") or expected_kind or "").lower().strip()
+    if expected_kind is not None:
+        kind = str(expected_kind).lower().strip()
+    if kind not in {"video", "audio"}:
+        return None
+    try:
+        size_bytes = max(0, int(value.get("size_bytes", 0) or 0))
+    except Exception:
+        size_bytes = 0
+    try:
+        duration = max(0.0, float(value.get("duration", 0.0) or 0.0))
+    except Exception:
+        duration = 0.0
+    try:
+        width = max(0, int(value.get("width", 0) or 0))
+        height = max(0, int(value.get("height", 0) or 0))
+    except Exception:
+        width = height = 0
+    try:
+        fps = max(0.0, float(value.get("fps", 0.0) or 0.0))
+    except Exception:
+        fps = 0.0
+    return {
+        "id": media_id,
+        "kind": kind,
+        "original_name": str(value.get("original_name") or value.get("name") or f"local_ref.{kind}"),
+        "size_bytes": size_bytes,
+        "duration": duration,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "has_audio": bool(value.get("has_audio", False)),
+    }
+
+
+def _normalize_local_refs(value):
+    raw = value if isinstance(value, dict) else {}
+    out = {"version": LOCAL_REFS_VERSION, "images": [], "videos": [], "audios": []}
+    seen = {"images": set(), "videos": set(), "audios": set()}
+    specs = (("images", MAX_IMAGE_REFS), ("videos", MAX_VIDEO_REFS), ("audios", MAX_STANDALONE_AUDIO_REFS))
+    for key, limit in specs:
+        source = raw.get(key) if isinstance(raw.get(key), list) else []
+        for item in source[:limit]:
+            item = item if isinstance(item, dict) else {}
+            try:
+                slot = int(item.get("slot", 0) or 0)
+            except Exception:
+                slot = 0
+            if slot < 1 or slot > limit or slot in seen[key]:
+                continue
+            if key == "images":
+                payload = _normalize_ref_descriptor(item.get("ref", item.get("image")))
+                if payload is None:
+                    continue
+                out[key].append({"slot": slot, "ref": payload})
+            else:
+                expected = "video" if key == "videos" else "audio"
+                payload = _normalize_media_descriptor(item.get("media", item), expected)
+                if payload is None:
+                    continue
+                out[key].append({"slot": slot, "media": payload})
+            seen[key].add(slot)
+    return out
+
+
+def _probe_media_file(path, kind):
+    path = Path(path)
+    ffmpeg = _find_ffmpeg()
+    proc = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", str(path)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    text = proc.stderr.decode("utf-8", errors="replace")
+    kind = str(kind).lower().strip()
+    video_lines = [line for line in text.splitlines() if " Video: " in line]
+    audio_lines = [line for line in text.splitlines() if " Audio: " in line]
+    if kind == "video" and not video_lines:
+        raise ValueError("MiniMax H3 Extender: uploaded local video contains no readable video stream.")
+    if kind == "audio" and not audio_lines:
+        raise ValueError("MiniMax H3 Extender: uploaded local audio contains no readable audio stream.")
+
+    duration = 0.0
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+    if match:
+        duration = int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+
+    width = height = 0
+    fps = 0.0
+    if video_lines:
+        vline = video_lines[0]
+        dims = re.search(r"(?<!\d)(\d{2,5})x(\d{2,5})(?!\d)", vline)
+        if dims:
+            width, height = int(dims.group(1)), int(dims.group(2))
+        fps_match = re.search(r"(\d+(?:\.\d+)?)\s+fps", vline)
+        if fps_match:
+            fps = float(fps_match.group(1))
+    return {
+        "duration": max(0.0, float(duration)),
+        "width": max(0, int(width)),
+        "height": max(0, int(height)),
+        "fps": max(0.0, float(fps)),
+        "has_audio": bool(audio_lines),
+    }
+
+
+def _store_uploaded_media(source_path, original_name, kind):
+    source_path = Path(source_path)
+    kind = str(kind).lower().strip()
+    if kind not in {"video", "audio"}:
+        raise ValueError("MiniMax H3 Extender: local media kind must be video or audio.")
+    meta = _probe_media_file(source_path, kind)
+    if float(meta.get("duration", 0.0) or 0.0) > 0.0 and float(meta["duration"]) + 1e-6 < MIN_REF_AUDIO_SECONDS:
+        raise ValueError(
+            f"MiniMax H3 Extender: local {kind} reference is only {float(meta['duration']):.3f}s; "
+            f"MiniMax H3 references require at least {MIN_REF_AUDIO_SECONDS:.0f}s."
+        )
+    media_id = _hash_file(source_path)
+    target = _local_media_path(media_id)
+    if not target.exists():
+        temp = _local_media_root() / f".upload_{uuid.uuid4().hex}.bin"
+        shutil.copyfile(source_path, temp)
+        try:
+            os.replace(temp, target)
+        finally:
+            temp.unlink(missing_ok=True)
+    return {
+        "id": media_id,
+        "kind": kind,
+        "original_name": str(original_name or f"local_ref.{kind}"),
+        "size_bytes": int(target.stat().st_size),
+        **meta,
+    }
+
+
+def _load_local_audio_media(desc, cache=None):
+    desc = _normalize_media_descriptor(desc, "audio")
+    if desc is None:
+        raise ValueError("MiniMax H3 Extender: invalid local audio metadata.")
+    cache = cache if isinstance(cache, dict) else {}
+    key = ("audio", desc["id"])
+    if key in cache:
+        return cache[key]
+    path = _local_media_path(desc["id"] )
+    if not path.exists():
+        raise FileNotFoundError(f"MiniMax H3 Extender: local audio '{desc['original_name']}' is missing.")
+    ffmpeg = _find_ffmpeg()
+    cmd = [
+        ffmpeg, "-v", "error", "-i", str(path), "-vn", "-t", str(MAX_REF_AUDIO_SECONDS),
+        "-ac", "2", "-ar", "48000", "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0 or not proc.stdout:
+        detail = proc.stderr.decode("utf-8", errors="replace")[-2000:]
+        raise RuntimeError(f"MiniMax H3 Extender: failed to decode local audio '{desc['original_name']}'. {detail}")
+    arr = np.frombuffer(proc.stdout, dtype=np.float32)
+    if arr.size < 2:
+        raise ValueError(f"MiniMax H3 Extender: local audio '{desc['original_name']}' decoded empty.")
+    arr = arr[: (arr.size // 2) * 2].reshape(-1, 2).T.copy()
+    audio = {"waveform": torch.from_numpy(arr).unsqueeze(0), "sample_rate": 48000}
+    cache[key] = audio
+    return audio
+
+
+def _load_local_video_media(desc, frame_count, cache=None):
+    desc = _normalize_media_descriptor(desc, "video")
+    if desc is None:
+        raise ValueError("MiniMax H3 Extender: invalid local video metadata.")
+    cache = cache if isinstance(cache, dict) else {}
+    wanted = max(5, min(int(frame_count or MAX_REF_VIDEO_FRAMES), MAX_REF_VIDEO_FRAMES))
+    key = ("video", desc["id"], wanted)
+    if key in cache:
+        return cache[key]
+    path = _local_media_path(desc["id"] )
+    if not path.exists():
+        raise FileNotFoundError(f"MiniMax H3 Extender: local video '{desc['original_name']}' is missing.")
+    width = int(desc.get("width", 0) or 0)
+    height = int(desc.get("height", 0) or 0)
+    if width <= 0 or height <= 0:
+        meta = _probe_media_file(path, "video")
+        width, height = int(meta["width"]), int(meta["height"])
+    if width <= 0 or height <= 0:
+        raise ValueError(f"MiniMax H3 Extender: could not determine dimensions for local video '{desc['original_name']}'.")
+    target_w, target_h = _adapt_ref_video_canvas(width, height)
+    ffmpeg = _find_ffmpeg()
+    vf = f"fps={FPS},scale={target_w}:{target_h}:flags=lanczos"
+    cmd = [
+        ffmpeg, "-v", "error", "-i", str(path), "-an", "-vf", vf,
+        "-frames:v", str(wanted), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0 or not proc.stdout:
+        detail = proc.stderr.decode("utf-8", errors="replace")[-2000:]
+        raise RuntimeError(f"MiniMax H3 Extender: failed to decode local video '{desc['original_name']}'. {detail}")
+    frame_bytes = int(target_w) * int(target_h) * 3
+    count = len(proc.stdout) // frame_bytes
+    if count <= 0:
+        raise ValueError(f"MiniMax H3 Extender: local video '{desc['original_name']}' decoded no frames.")
+    raw = np.frombuffer(proc.stdout[:count * frame_bytes], dtype=np.uint8).reshape(count, target_h, target_w, 3).copy()
+    video = torch.from_numpy(raw)
+    cache[key] = video
+    return video
 
 
 def _empty_refs():
@@ -516,21 +743,50 @@ def _normalize_external_ref_pack(value):
     }
 
 
-def _sync_refs_from_ref_pack(refs, pack):
+def _local_picture_slot_reservations(clips):
+    """Return global Picture slot numbers reserved by at least one clip-local ref."""
+    reserved = set()
+    for cfg in clips or []:
+        local = _normalize_local_refs((cfg or {}).get("local_refs"))
+        for item in local.get("images", []):
+            try:
+                slot = int(item.get("slot", 0) or 0)
+            except Exception:
+                slot = 0
+            if 1 <= slot <= MAX_IMAGE_REFS:
+                reserved.add(slot)
+    return reserved
+
+
+def _sync_refs_from_ref_pack(refs, pack, reserved_slots=None):
     """Inject connected external slots into the existing internal Ref N slots.
 
     Empty external slots are deliberately no-ops: they never clear or compact an
-    internal reference.  Connected slots keep their exact logical number.
+    internal reference. Connected slots keep their exact logical number.
+
+    A slot already reserved by any clip-local Picture is skipped, not remapped and
+    never treated as a fatal error. Local refs deliberately win so an external
+    Reference Pack cannot block an otherwise valid render.
     """
     refs = _normalize_ref_descriptors(refs)
     if pack is None:
-        return refs, []
+        return refs, [], []
 
+    reserved_slots = {int(x) for x in (reserved_slots or set()) if 1 <= int(x) <= MAX_IMAGE_REFS}
     imported_slots = []
+    skipped_slots = []
     for index, image in enumerate(pack.get("slots") or [], start=1):
         if index > MAX_IMAGE_REFS:
             break
         if image is None:
+            continue
+        if index in reserved_slots:
+            skipped_slots.append(index)
+            _LOG.warning(
+                "H3 Extender: Reference Pack Ref %d ignored because Picture %d is reserved by a local clip reference.",
+                index,
+                index,
+            )
             continue
         try:
             descriptor, changed = _store_external_reference(
@@ -546,7 +802,7 @@ def _sync_refs_from_ref_pack(refs, pack):
         if changed:
             imported_slots.append(index)
 
-    return refs, imported_slots
+    return refs, imported_slots, skipped_slots
 
 
 def _edit_internal_reference(source_id, original_name, brightness, contrast, saturation, external_signature=""):
@@ -788,6 +1044,8 @@ def _resolution_from_manifest(manifest):
 
 def _resize(image, width: int, height: int):
     samples = image[..., :3].movedim(-1, 1)
+    if samples.dtype == torch.uint8:
+        samples = samples.float().div_(255.0)
     samples = comfy.utils.common_upscale(
         samples, int(width), int(height), "lanczos", "disabled"
     )
@@ -869,7 +1127,7 @@ def _resize_ref_video_h3_frames(
     out = torch.empty(
         (count, int(height), int(width), 3),
         device=video_frames.device,
-        dtype=video_frames.dtype,
+        dtype=(torch.float32 if video_frames.dtype == torch.uint8 else video_frames.dtype),
     )
     for start in range(0, count, chunk_frames):
         end = min(count, start + chunk_frames)
@@ -1672,6 +1930,7 @@ def _default_clip(index: int = 0):
         "validated": False,
         "color_adjustment": _normalize_color_adjustment(),
         "loras": [],
+        "local_refs": _normalize_local_refs(None),
         "first_frame": None,
         "last_frame": None,
         "guides": [],
@@ -1755,6 +2014,7 @@ def _parse_clips_json(value: str, generation_mode="ref2va"):
                 "validated": bool(raw.get("validated", False)),
                 "color_adjustment": _normalize_color_adjustment(raw.get("color_adjustment")),
                 "loras": _normalize_clip_loras(raw.get("loras"), legacy=raw.get("lora")),
+                "local_refs": _normalize_local_refs(raw.get("local_refs")),
                 "first_frame": _normalize_ref_descriptor(raw.get("first_frame")),
                 "last_frame": _normalize_ref_descriptor(raw.get("last_frame")),
                 "guides": _normalize_fl2va_guides(
@@ -2067,7 +2327,7 @@ def _send_extender_prompt_pack_import(node_id, clips_json, prompt_count, source=
         pass
 
 
-def _send_extender_ref_pack_import(node_id, refs_json, imported_slots, ref_count, source=""):
+def _send_extender_ref_pack_import(node_id, refs_json, imported_slots, ref_count, source="", skipped_slots=None):
     try:
         server = PromptServer.instance
         if server is None:
@@ -2078,6 +2338,7 @@ def _send_extender_ref_pack_import(node_id, refs_json, imported_slots, ref_count
                 "node": str(node_id),
                 "refs_json": str(refs_json),
                 "imported_slots": [int(i) for i in imported_slots or []],
+                "skipped_slots": [int(i) for i in skipped_slots or []],
                 "ref_count": int(ref_count),
                 "source": str(source or "External reference pack"),
             },
@@ -2227,6 +2488,27 @@ def _fl2va_frame_entries(project_payload):
             if isinstance(ref, dict) and _ref_id_is_safe(ref.get("id")):
                 entries.append((index, f"guide_{guide_index}", ref))
     return entries
+
+
+def _local_ref_assets_from_clips(clips):
+    image_refs = {}
+    media_refs = {}
+    for cfg in clips or []:
+        local = _normalize_local_refs(cfg.get("local_refs"))
+        for item in local.get("images", []):
+            ref = item.get("ref") if isinstance(item, dict) else None
+            if not isinstance(ref, dict):
+                continue
+            for ref_id in (ref.get("id"), ref.get("source_id")):
+                if _ref_id_is_safe(ref_id):
+                    image_refs[str(ref_id)] = ref
+        for key in ("videos", "audios"):
+            for item in local.get(key, []):
+                media = item.get("media") if isinstance(item, dict) else None
+                media = _normalize_media_descriptor(media, "video" if key == "videos" else "audio")
+                if media is not None:
+                    media_refs[media["id"]] = media
+    return image_refs, media_refs
 
 
 def _project_cache_snapshot(owner_id, project_payload):
@@ -2450,6 +2732,33 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             _validate_reference_file(source_path)
             frame_source_files.append((clip_index, kind, source_id, source_path))
 
+    # Ref2VA local-per-clip references are portable too. Image refs reuse the
+    # same content-addressed PNG store; local video/audio keep their original
+    # uploaded bytes in a separate content-addressed media store.
+    local_image_files = []
+    local_media_files = []
+    project_clips = _clips_from_project_payload(project_payload)
+    local_image_refs, local_media_refs = _local_ref_assets_from_clips(project_clips)
+    for ref_id in sorted(local_image_refs):
+        path = _ref_path(ref_id)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"MiniMax H3 Extender Project: local image reference {ref_id[:10]} is missing from the internal store."
+            )
+        _validate_reference_file(path)
+        local_image_files.append((ref_id, path))
+    for media_id, media in sorted(local_media_refs.items()):
+        path = _local_media_path(media_id)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"MiniMax H3 Extender Project: local {media['kind']} reference '{media['original_name']}' is missing."
+            )
+        if int(path.stat().st_size) > MAX_LOCAL_MEDIA_UPLOAD_BYTES:
+            raise ValueError(
+                f"MiniMax H3 Extender Project: local media '{media['original_name']}' exceeds the portable-project size limit."
+            )
+        local_media_files.append((media_id, media, path))
+
     # FL2VA random-access editing is append-only for speed. Save Project is the
     # natural point to force compaction so both the live cache and portable .ext
     # contain only currently referenced latent/PCM blobs.
@@ -2522,6 +2831,8 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             "original_sources": int(len(source_ref_files)),
             "fl2va_frames": int(len(frame_files)),
             "fl2va_original_sources": int(len(frame_source_files)),
+            "local_images": int(len(local_image_files)),
+            "local_media": int(len(local_media_files)),
         },
         "cache": {
             "present": snapshot is not None,
@@ -2579,6 +2890,19 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
                 arcname=f"fl2va/original_clip_{clip_index}_{kind}.png",
                 compress_type=zipfile.ZIP_STORED,
             )
+        for ref_id, path in local_image_files:
+            zf.write(
+                path,
+                arcname=f"local_refs/images/{ref_id}.png",
+                compress_type=zipfile.ZIP_STORED,
+            )
+        for media_id, media, path in local_media_files:
+            zf.write(
+                path,
+                arcname=f"local_refs/media/{media_id}.bin",
+                compress_type=zipfile.ZIP_STORED,
+            )
+
         for index, item in enumerate(continuity_files, start=1):
             zf.write(
                 item["png_path"],
@@ -2776,6 +3100,44 @@ def _import_project_archive(owner_id, archive_path):
             project_payload["extender"].setdefault("settings", {})["generation_mode"] = generation_mode
             clips = _clips_from_project_payload(project_payload)
             project_prompt_pack_signature = _prompt_pack_signature_from_project_payload(project_payload)
+
+            # Restore local per-clip assets. Their ids are content hashes, so the
+            # clip JSON stays stable across machines and no slot remapping occurs.
+            local_image_refs, local_media_refs = _local_ref_assets_from_clips(clips)
+            for ref_id in sorted(local_image_refs):
+                member = f"local_refs/images/{ref_id}.png"
+                if member not in names:
+                    raise ValueError(
+                        f"MiniMax H3 Extender Project: local image reference {ref_id[:10]} is missing."
+                    )
+                info = zf.getinfo(member)
+                if int(info.file_size) > MAX_REF_UPLOAD_BYTES:
+                    raise ValueError("MiniMax H3 Extender Project: local image reference is unexpectedly large.")
+                temp_ref = work_root / f"local_image_{ref_id}.png"
+                _zip_copy_member(zf, member, temp_ref)
+                restored = _store_project_reference(
+                    temp_ref, local_image_refs[ref_id].get("original_name") or "local_ref.png"
+                )
+                if str(restored.get("id") or "") != str(ref_id):
+                    raise ValueError("MiniMax H3 Extender Project: local image reference failed its integrity check.")
+
+            for media_id, media in sorted(local_media_refs.items()):
+                member = f"local_refs/media/{media_id}.bin"
+                if member not in names:
+                    raise ValueError(
+                        f"MiniMax H3 Extender Project: local {media['kind']} reference '{media['original_name']}' is missing."
+                    )
+                info = zf.getinfo(member)
+                if int(info.file_size) > MAX_LOCAL_MEDIA_UPLOAD_BYTES:
+                    raise ValueError("MiniMax H3 Extender Project: local media reference is unexpectedly large.")
+                temp_media = work_root / f"local_media_{media_id}.bin"
+                _zip_copy_member(zf, member, temp_media)
+                if _hash_file(temp_media) != str(media_id):
+                    raise ValueError("MiniMax H3 Extender Project: local media reference failed its integrity check.")
+                _probe_media_file(temp_media, media["kind"])
+                target_media = _local_media_path(media_id)
+                if not target_media.exists():
+                    shutil.copyfile(temp_media, target_media)
 
             # v2 embeds the real reference pixels. Import each image into the
             # Extender's content-addressed store and rewrite the returned project
@@ -4061,14 +4423,20 @@ class MiniMaxH3Extender:
 
         refs = _parse_refs_json(refs_json)
         external_ref_pack = _normalize_external_ref_pack(ref_pack)
-        refs, ref_pack_imported_slots = _sync_refs_from_ref_pack(refs, external_ref_pack)
-        if ref_pack_imported_slots and external_ref_pack is not None:
+        local_picture_slots = _local_picture_slot_reservations(clips)
+        refs, ref_pack_imported_slots, ref_pack_skipped_slots = _sync_refs_from_ref_pack(
+            refs,
+            external_ref_pack,
+            local_picture_slots,
+        )
+        if (ref_pack_imported_slots or ref_pack_skipped_slots) and external_ref_pack is not None:
             _send_extender_ref_pack_import(
                 owner,
                 _refs_json(refs),
                 ref_pack_imported_slots,
                 int(external_ref_pack.get("count", 0) or 0),
                 external_ref_pack.get("source") or "External reference pack",
+                skipped_slots=ref_pack_skipped_slots,
             )
         refs_signature = _refs_signature(refs)
         requested_resolution = _resolve_generation_resolution(
@@ -4176,6 +4544,7 @@ class MiniMaxH3Extender:
         # after the duration previously consumed from Audio 1.
         standalone_audio_clip_plan = _build_standalone_audio_clip_plan(clips, ref_audios)
         standalone_audio_cache = {}
+        local_media_decode_cache = {}
 
         ref_items = None
         ref_blocks = None
@@ -4312,76 +4681,148 @@ class MiniMaxH3Extender:
 
             frame_count = _duration_to_frames(cfg["duration"])
 
-            # Standalone Audio selection is deterministic per clip. One connected
-            # ref remains the global/timeline ref regardless of prompt tags. With
-            # several refs, <Audio N> selects explicitly; without a usable tag,
-            # the first connected logical ref is used instead of stacking them.
+            # Global references keep their historical semantics. Local references
+            # are clip-only additions that occupy still-free logical Picture/Video/Audio
+            # slots; they never replace/remap a global slot silently.
+            local_refs = _normalize_local_refs(cfg.get("local_refs"))
+            clip_refs = list(refs)
+            clip_ref_videos = list(ref_videos)
+            clip_ref_video_fps = list(ref_video_fps)
+            clip_ref_video_audios = list(ref_video_audios)
+
+            local_visual = False
+            for item in local_refs.get("images", []):
+                slot = int(item["slot"])
+                if clip_refs[slot - 1] is not None:
+                    _LOG.warning(
+                        "H3 Extender: Clip %d local Picture %d overrides a conflicting global Picture %d for this clip.",
+                        i + 1,
+                        slot,
+                        slot,
+                    )
+                clip_refs[slot - 1] = item["ref"]
+                local_visual = True
+
+            for item in local_refs.get("videos", []):
+                slot = int(item["slot"])
+                if clip_ref_videos[slot - 1] is not None:
+                    _LOG.warning(
+                        "H3 Extender: Clip %d local Video %d overrides a conflicting global Video %d for this clip.",
+                        i + 1,
+                        slot,
+                        slot,
+                    )
+                clip_ref_videos[slot - 1] = _load_local_video_media(
+                    item["media"], frame_count, cache=local_media_decode_cache
+                )
+                clip_ref_video_fps[slot - 1] = float(FPS)
+                clip_ref_video_audios[slot - 1] = None
+                local_visual = True
+
+            # Standalone global Audio selection remains exactly as before. Local
+            # Audio refs are explicit per-card additions and therefore always used
+            # by that card, at source offset zero.
             selected_ref_audios, selected_audio_slots, selected_audio_offsets = standalone_audio_clip_plan[i]
+            selected_ref_audios = list(selected_ref_audios)
+            selected_audio_slots = list(selected_audio_slots)
+            selected_audio_offsets = dict(selected_audio_offsets)
+            for item in local_refs.get("audios", []):
+                slot = int(item["slot"])
+                if ref_audios[slot - 1] is not None:
+                    _LOG.warning(
+                        "H3 Extender: Clip %d local Audio %d overrides a conflicting global Audio %d for this clip.",
+                        i + 1,
+                        slot,
+                        slot,
+                    )
+                selected_ref_audios[slot - 1] = _load_local_audio_media(
+                    item["media"], cache=local_media_decode_cache
+                )
+                if slot not in selected_audio_slots:
+                    selected_audio_slots.append(slot)
+                selected_audio_offsets[slot] = 0.0
+            selected_audio_slots = sorted(set(int(x) for x in selected_audio_slots))
             selected_ref_audio_count = len(selected_audio_slots)
+
+            active_clip_video_count = sum(video is not None for video in clip_ref_videos)
             clip_mixed_ref_count = (
-                _reference_count(refs)
-                + active_ref_video_count
+                _reference_count(clip_refs)
+                + active_clip_video_count
                 + selected_ref_audio_count
             )
             if clip_mixed_ref_count > MAX_MIXED_REF_ITEMS:
                 raise ValueError(
-                    f"MiniMax H3 Extender: H3 Ref2VA supports at most {MAX_MIXED_REF_ITEMS} mixed reference items for this clip; "
-                    f"got {clip_mixed_ref_count}."
+                    f"MiniMax H3 Extender: Clip {i + 1} has {clip_mixed_ref_count} mixed references; "
+                    f"MiniMax H3 supports at most {MAX_MIXED_REF_ITEMS}."
                 )
 
-            # Reference-video conditioning is cropped/aligned against the target
-            # clip duration. Reuse the prepared payload while duration is the
-            # same, but rebuild it if a later card uses a different frame count.
-            needs_ref_prepare = (
-                ref_items is None
-                or ref_blocks is None
-                or active_picture_slots is None
-                or active_video_slots is None
-                or (active_ref_video_count and prepared_ref_frame_count != frame_count)
-            )
-            if needs_ref_prepare:
-                cached_video_blocks = prepared_video_blocks_by_frame_count.get(int(frame_count))
-                ref_items, ref_blocks, active_picture_slots, active_video_slots = _prepare_shared_refs(
+            if local_visual:
+                # Beta path: only clips that own local image/video refs rebuild
+                # visual conditioning. Clips without locals keep the optimized
+                # global-reference cache unchanged.
+                clip_base_items, clip_base_blocks, clip_picture_slots, clip_video_slots = _prepare_shared_refs(
                     vae,
                     audio_vae,
                     resolved_width,
                     resolved_height,
                     str(ref_image_size),
-                    refs,
-                    ref_videos=ref_videos,
-                    ref_video_fps=ref_video_fps,
-                    ref_video_audios=ref_video_audios,
+                    clip_refs,
+                    ref_videos=clip_ref_videos,
+                    ref_video_fps=clip_ref_video_fps,
+                    ref_video_audios=clip_ref_video_audios,
                     standalone_audio_count=0,
                     frame_count=frame_count,
-                    cached_image_blocks=prepared_image_blocks,
-                    cached_video_blocks=cached_video_blocks,
                 )
-                image_block_count = len(active_picture_slots or [])
-                if prepared_image_blocks is None:
-                    prepared_image_blocks = list((ref_blocks or [])[:image_block_count])
-                if active_ref_video_count:
-                    # Refresh insertion order on a cache hit: this is a real
-                    # two-entry LRU, not just a FIFO. The common 5s/10s/5s
-                    # pattern therefore keeps both useful duration blocks.
-                    duration_key = int(frame_count)
-                    prepared_video_blocks_by_frame_count.pop(duration_key, None)
-                    prepared_video_blocks_by_frame_count[duration_key] = list((ref_blocks or [])[image_block_count:])
-                    while len(prepared_video_blocks_by_frame_count) > 2:
-                        oldest_key = next(iter(prepared_video_blocks_by_frame_count))
-                        prepared_video_blocks_by_frame_count.pop(oldest_key, None)
-                prepared_ref_frame_count = frame_count
+            else:
+                needs_ref_prepare = (
+                    ref_items is None
+                    or ref_blocks is None
+                    or active_picture_slots is None
+                    or active_video_slots is None
+                    or (active_ref_video_count and prepared_ref_frame_count != frame_count)
+                )
+                if needs_ref_prepare:
+                    cached_video_blocks = prepared_video_blocks_by_frame_count.get(int(frame_count))
+                    ref_items, ref_blocks, active_picture_slots, active_video_slots = _prepare_shared_refs(
+                        vae,
+                        audio_vae,
+                        resolved_width,
+                        resolved_height,
+                        str(ref_image_size),
+                        refs,
+                        ref_videos=ref_videos,
+                        ref_video_fps=ref_video_fps,
+                        ref_video_audios=ref_video_audios,
+                        standalone_audio_count=0,
+                        frame_count=frame_count,
+                        cached_image_blocks=prepared_image_blocks,
+                        cached_video_blocks=cached_video_blocks,
+                    )
+                    image_block_count = len(active_picture_slots or [])
+                    if prepared_image_blocks is None:
+                        prepared_image_blocks = list((ref_blocks or [])[:image_block_count])
+                    if active_ref_video_count:
+                        duration_key = int(frame_count)
+                        prepared_video_blocks_by_frame_count.pop(duration_key, None)
+                        prepared_video_blocks_by_frame_count[duration_key] = list((ref_blocks or [])[image_block_count:])
+                        while len(prepared_video_blocks_by_frame_count) > 2:
+                            oldest_key = next(iter(prepared_video_blocks_by_frame_count))
+                            prepared_video_blocks_by_frame_count.pop(oldest_key, None)
+                    prepared_ref_frame_count = frame_count
+                clip_base_items = ref_items or []
+                clip_base_blocks = ref_blocks or []
+                clip_picture_slots = active_picture_slots or []
+                clip_video_slots = active_video_slots or []
 
-            clip_ref_items = list(ref_items or [])
-            clip_ref_blocks = list(ref_blocks or [])
-            # Paired video soundtracks are already packed before standalone Audio
-            # refs and therefore consume the first native <Audio N> ordinals.
+            clip_ref_items = list(clip_base_items or [])
+            clip_ref_blocks = list(clip_base_blocks or [])
             audio_native_offset = sum(
                 1
-                for item in (ref_items or [])
+                for item in (clip_base_items or [])
                 if isinstance(item, dict) and item.get("type") == "audio"
             )
             if selected_ref_audio_count:
-                if (_reference_count(refs) + active_ref_video_count) < 1:
+                if (_reference_count(clip_refs) + active_clip_video_count) < 1:
                     raise ValueError(
                         "MiniMax H3 Extender: standalone reference audio requires at least one image or video reference."
                     )
@@ -4408,8 +4849,8 @@ class MiniMaxH3Extender:
                 frame_count,
                 clip_ref_items,
                 clip_ref_blocks,
-                active_picture_slots,
-                active_video_slots,
+                clip_picture_slots,
+                clip_video_slots,
                 active_audio_slots=selected_audio_slots,
                 audio_native_offset=audio_native_offset,
             )
@@ -4578,11 +5019,16 @@ class MiniMaxH3Extender:
         ref_pack_text = ""
         if external_ref_pack is not None:
             connected_ref_count = int(external_ref_pack.get("count", 0) or 0)
+            details = []
             if ref_pack_imported_slots:
                 imported_text = ",".join(str(i) for i in ref_pack_imported_slots)
-                ref_pack_text = f" | ref pack {connected_ref_count} linked, imported Ref {imported_text}"
-            else:
-                ref_pack_text = f" | ref pack {connected_ref_count} linked"
+                details.append(f"imported Ref {imported_text}")
+            if ref_pack_skipped_slots:
+                skipped_text = ",".join(str(i) for i in ref_pack_skipped_slots)
+                details.append(f"ignored local-reserved Ref {skipped_text}")
+            ref_pack_text = f" | ref pack {connected_ref_count} linked"
+            if details:
+                ref_pack_text += ", " + "; ".join(details)
         status = (
             f"{str(run_mode)} | {resolution_text} | refs {_reference_count(refs)} | video refs {active_ref_video_count}"
             f" | video audios {active_ref_video_audio_count} | audio refs {active_ref_audio_count} | cached {cached_count}/{len(clips)} | "
@@ -4650,6 +5096,7 @@ class MiniMaxH3Extender:
             "ref_pack_connected": external_ref_pack is not None,
             "ref_pack_count": int(external_ref_pack.get("count", 0) or 0) if external_ref_pack is not None else 0,
             "ref_pack_imported_slots": [int(i) for i in ref_pack_imported_slots],
+            "ref_pack_skipped_slots": [int(i) for i in ref_pack_skipped_slots],
             "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
             "build": BUILD,
         }
@@ -4734,6 +5181,86 @@ if getattr(PromptServer, "instance", None) is not None:
             except Exception as exc:
                 return web.json_response({"ok": False, "error": str(exc)}, status=400)
             return web.json_response({"ok": True, "ref": ref})
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    @PromptServer.instance.routes.get("/h3_extender/local_media/{media_id}")
+    async def h3_extender_local_media_preview(request):
+        """Serve one internal clip-local media ref inline for the Refs dialog player."""
+        try:
+            media_id = str(request.match_info.get("media_id") or "").lower().strip()
+            if not _ref_id_is_safe(media_id):
+                return web.json_response({"ok": False, "error": "Invalid local media reference id."}, status=400)
+            path = _local_media_path(media_id)
+            if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+                return web.json_response({"ok": False, "error": "Local media reference not found."}, status=404)
+
+            kind = str(request.query.get("kind") or "").lower().strip()
+            original_name = str(request.query.get("name") or "")
+            guessed_type, _ = mimetypes.guess_type(original_name)
+            if kind == "video" and (not guessed_type or not guessed_type.startswith("video/")):
+                guessed_type = "video/mp4"
+            elif kind == "audio" and (not guessed_type or not guessed_type.startswith("audio/")):
+                guessed_type = "audio/mpeg"
+            elif not guessed_type:
+                guessed_type = "application/octet-stream"
+
+            response = web.FileResponse(path)
+            response.content_type = guessed_type
+            response.headers["Content-Disposition"] = "inline"
+            response.headers["Cache-Control"] = "private, max-age=3600"
+            return response
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+
+    @PromptServer.instance.routes.post("/h3_extender/local_media/upload")
+    async def h3_extender_local_media_upload(request):
+        """Upload one clip-local video/audio reference into the internal media store."""
+        temp_path = _project_temp_root() / f"local_media_upload_{uuid.uuid4().hex}.bin"
+        original_name = "local_ref.bin"
+        kind = ""
+        got_file = False
+        size = 0
+        try:
+            reader = await request.multipart()
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                if part.name == "kind":
+                    kind = (await part.text()).strip().lower()
+                    continue
+                if part.name != "media_file":
+                    continue
+                original_name = str(part.filename or "local_ref.bin")
+                with open(temp_path, "wb") as f:
+                    while True:
+                        chunk = await part.read_chunk(size=PROJECT_COPY_CHUNK)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > MAX_LOCAL_MEDIA_UPLOAD_BYTES:
+                            raise ValueError(
+                                f"MiniMax H3 Extender: local media upload exceeds {MAX_LOCAL_MEDIA_UPLOAD_BYTES // (1024 * 1024)} MB."
+                            )
+                        f.write(chunk)
+                    f.flush()
+                    os.fsync(f.fileno())
+                got_file = True
+            if kind not in {"video", "audio"}:
+                return web.json_response({"ok": False, "error": "Local media kind must be video or audio."}, status=400)
+            if not got_file or not temp_path.exists() or temp_path.stat().st_size <= 0:
+                return web.json_response({"ok": False, "error": "No local media file was uploaded."}, status=400)
+            try:
+                media = await asyncio.to_thread(_store_uploaded_media, temp_path, original_name, kind)
+            except Exception as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=400)
+            return web.json_response({"ok": True, "media": media})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
         finally:
