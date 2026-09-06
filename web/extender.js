@@ -31,6 +31,7 @@ const REF_THUMB_HEIGHT = 96;
 const REF_SCROLLBAR_SPACE = 14;
 const REF_SECTION_HEIGHT = 160;
 const MAX_IMAGE_REFS = 9;
+const MAX_MIXED_REFS = 12;
 const MAX_FL2VA_GUIDES = 3;
 const MAX_RESOLUTION = 4096;
 const DEFAULT_MEGAPIXELS = 0.40;
@@ -143,6 +144,74 @@ function normalizeRefDescriptor(value) {
     return descriptor;
 }
 
+function normalizeMediaDescriptor(value, expectedKind = "") {
+    if (!value || typeof value !== "object") return null;
+    const id = String(value.id || value.media_id || "").toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(id)) return null;
+    const kind = String(expectedKind || value.kind || "").toLowerCase();
+    if (!["video", "audio"].includes(kind)) return null;
+    return {
+        id,
+        kind,
+        original_name: String(value.original_name || value.name || `local_ref.${kind}`),
+        size_bytes: Math.max(0, Number(value.size_bytes || 0)),
+        duration: Math.max(0, Number(value.duration || 0)),
+        width: Math.max(0, Number(value.width || 0)),
+        height: Math.max(0, Number(value.height || 0)),
+        fps: Math.max(0, Number(value.fps || 0)),
+        has_audio: Boolean(value.has_audio),
+    };
+}
+
+function localMediaPreviewUrl(value) {
+    const media = normalizeMediaDescriptor(value);
+    if (!media) return "";
+    const base = api.apiURL(`/h3_extender/local_media/${media.id}`);
+    const params = new URLSearchParams();
+    params.set("kind", media.kind);
+    // The original name is never displayed in the UI; it is used only so the
+    // backend can return the correct MIME type for the browser player.
+    if (media.original_name) params.set("name", media.original_name);
+    return `${base}?${params.toString()}`;
+}
+
+function emptyLocalRefs() {
+    return { version: 1, images: [], videos: [], audios: [] };
+}
+
+function normalizeLocalRefs(value) {
+    const raw = value && typeof value === "object" ? value : {};
+    const out = emptyLocalRefs();
+    const normalizeRows = (key, limit, kind = "") => {
+        const seen = new Set();
+        const rows = Array.isArray(raw[key]) ? raw[key] : [];
+        for (const item of rows.slice(0, limit)) {
+            const slot = Math.trunc(Number(item?.slot || 0));
+            if (!(slot >= 1 && slot <= limit) || seen.has(slot)) continue;
+            if (key === "images") {
+                const ref = normalizeRefDescriptor(item?.ref || item?.image);
+                if (!ref) continue;
+                out.images.push({ slot, ref });
+            } else {
+                const media = normalizeMediaDescriptor(item?.media || item, kind);
+                if (!media) continue;
+                out[key].push({ slot, media });
+            }
+            seen.add(slot);
+        }
+        out[key].sort((a, b) => a.slot - b.slot);
+    };
+    normalizeRows("images", MAX_IMAGE_REFS);
+    normalizeRows("videos", MAX_VIDEO_REFS, "video");
+    normalizeRows("audios", MAX_STANDALONE_AUDIO_REFS, "audio");
+    return out;
+}
+
+function localRefCount(clip) {
+    const local = normalizeLocalRefs(clip?.local_refs);
+    return local.images.length + local.videos.length + local.audios.length;
+}
+
 function normalizeRefsArray(values) {
     // Ref slots are stable logical identities. Never compact holes: moving Ref 3
     // into Ref 2 would silently break prompts that intentionally use <Picture 3>.
@@ -241,6 +310,111 @@ function removeDynamicRefInput(node, name) {
     } catch (_) {
         return false;
     }
+}
+
+function globalReferenceOccupancy(node, runtime) {
+    const pictures = new Set();
+    const videos = new Set();
+    const audios = new Set();
+    (runtime?.refsState?.refs || []).forEach((ref, index) => {
+        if (ref) pictures.add(index + 1);
+    });
+    for (let slot = 1; slot <= MAX_VIDEO_REFS; slot++) {
+        if (
+            inputConnected(findInputEntry(node, `ref_video_${slot}`)?.input)
+            || inputConnected(findInputEntry(node, `ref_video_fps_${slot}`)?.input)
+            || inputConnected(findInputEntry(node, `ref_video_audio_${slot}`)?.input)
+        ) videos.add(slot);
+    }
+    let numberedAudioConnected = false;
+    for (let slot = 1; slot <= MAX_STANDALONE_AUDIO_REFS; slot++) {
+        if (inputConnected(findInputEntry(node, `ref_audio_${slot}`)?.input)) {
+            audios.add(slot);
+            numberedAudioConnected = true;
+        }
+    }
+    if (!numberedAudioConnected && inputConnected(findInputEntry(node, "ref_audio")?.input)) {
+        audios.add(1);
+    }
+    return { pictures, videos, audios };
+}
+
+function usedLocalSlots(clip, kind) {
+    const local = normalizeLocalRefs(clip?.local_refs);
+    const key = kind === "picture" ? "images" : (kind === "video" ? "videos" : "audios");
+    return new Set((local[key] || []).map((item) => Number(item.slot)));
+}
+
+function localSlotReservations(runtime, kind) {
+    // Local slot numbers are clip-local identities, so different clips may reuse
+    // the same logical number. A GLOBAL slot, however, must stay unavailable as
+    // long as at least one clip owns that number locally; otherwise adding a new
+    // global later would silently collide with an existing clip-local tag.
+    const reserved = new Set();
+    for (const clip of runtime?.state?.clips || []) {
+        for (const slot of usedLocalSlots(clip, kind)) reserved.add(Number(slot));
+    }
+    return reserved;
+}
+
+function firstFreeLocalSlot(node, runtime, clip, kind) {
+    const occupied = globalReferenceOccupancy(node, runtime);
+    const globalSet = kind === "picture" ? occupied.pictures : (kind === "video" ? occupied.videos : occupied.audios);
+    const localSet = usedLocalSlots(clip, kind);
+    const limit = kind === "picture" ? MAX_IMAGE_REFS : (kind === "video" ? MAX_VIDEO_REFS : MAX_STANDALONE_AUDIO_REFS);
+    for (let slot = 1; slot <= limit; slot++) {
+        if (!globalSet.has(slot) && !localSet.has(slot)) return slot;
+    }
+    return null;
+}
+
+function localRefsConflictSummary(node, runtime, clip) {
+    const occupied = globalReferenceOccupancy(node, runtime);
+    const local = normalizeLocalRefs(clip?.local_refs);
+    const conflicts = [];
+    for (const item of local.images) if (occupied.pictures.has(item.slot)) conflicts.push(`Picture ${item.slot}`);
+    for (const item of local.videos) if (occupied.videos.has(item.slot)) conflicts.push(`Video ${item.slot}`);
+    for (const item of local.audios) if (occupied.audios.has(item.slot)) conflicts.push(`Audio ${item.slot}`);
+    return conflicts;
+}
+
+async function persistLocalRefInvalidation(node, runtime, clipIndex) {
+    const index = Number(clipIndex);
+    if (!Number.isInteger(index) || index < 0) return false;
+    const generationMode = String(runtime?.state?.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+    try {
+        const response = await fetch(api.apiURL("/h3_extender/local_ref_invalidate"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                owner_id: String(node?.id ?? ""),
+                generation_mode: generationMode,
+                clip_index: index,
+                clip_id: String(runtime?.state?.clips?.[index]?.id || ""),
+            }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok) {
+            throw new Error(payload?.error || `Local reference invalidation failed (${response.status}).`);
+        }
+        return true;
+    } catch (error) {
+        runtime.statusText = `Local reference invalidation failed: ${String(error?.message || error)}`;
+        alert(runtime.statusText);
+        return false;
+    }
+}
+
+async function prepareLocalRefMutation(node, runtime, clipIndex) {
+    const index = Number(clipIndex);
+    if (!Number.isInteger(index) || index < 0) return false;
+    if (runtime?.computedIndices?.has(index)) {
+        const ok = await discardComputedClip(node, runtime, index);
+        if (!ok) return false;
+    }
+    invalidateFrom(runtime.state, index);
+    if (!(await persistLocalRefInvalidation(node, runtime, index))) return false;
+    return true;
 }
 
 function graphLinkById(graph, linkId) {
@@ -381,8 +555,39 @@ function highestConnectedIndex(node, regex, maxIndex) {
     return highest;
 }
 
-function syncDynamicAVReferenceInputs(node) {
+function desiredGlobalDynamicSlots(node, runtime, regex, limit, kind) {
+    const reserved = localSlotReservations(runtime, kind);
+    const connected = new Set();
+    let highestConnected = 0;
+    for (const input of node?.inputs || []) {
+        const match = String(input?.name || "").match(regex);
+        if (!match || !inputConnected(input)) continue;
+        const slot = Number(match[1]);
+        if (!(slot >= 1 && slot <= limit)) continue;
+        connected.add(slot);
+        highestConnected = Math.max(highestConnected, slot);
+    }
+
+    const desired = new Set(connected);
+    // Preserve the historical numbered progression up to the highest connected
+    // global slot, but skip numbers that are owned locally.
+    for (let slot = 1; slot <= highestConnected; slot++) {
+        if (!reserved.has(slot)) desired.add(slot);
+    }
+    // Always expose exactly the next available free global slot. If Local Video 1
+    // owns slot 1, for example, the first offered global socket becomes Video 2.
+    for (let slot = highestConnected + 1; slot <= limit; slot++) {
+        if (!reserved.has(slot) && !connected.has(slot)) {
+            desired.add(slot);
+            break;
+        }
+    }
+    return desired;
+}
+
+function syncDynamicAVReferenceInputs(node, runtime = null) {
     if (!node || node.__h3AVRefSyncing) return;
+    runtime = runtime || node.__h3Extender || null;
     node.__h3AVRefSyncing = true;
     let changed = false;
     try {
@@ -393,14 +598,12 @@ function syncDynamicAVReferenceInputs(node) {
         // the highest connected audio, up to H3's three-audio limit. Connected
         // higher slots are never removed, so loading sparse/older workflows does
         // not destroy cables.
-        const highestAudio = highestConnectedIndex(node, REF_AUDIO_RE, MAX_STANDALONE_AUDIO_REFS);
-        const visibleAudioMax = Math.min(
-            MAX_STANDALONE_AUDIO_REFS,
-            Math.max(1, highestAudio + 1),
+        const desiredAudioSlots = desiredGlobalDynamicSlots(
+            node, runtime, REF_AUDIO_RE, MAX_STANDALONE_AUDIO_REFS, "audio"
         );
         for (let i = 1; i <= MAX_STANDALONE_AUDIO_REFS; i++) {
             const name = `ref_audio_${i}`;
-            if (i <= visibleAudioMax) {
+            if (desiredAudioSlots.has(i)) {
                 changed = addDynamicRefInput(
                     node,
                     name,
@@ -418,8 +621,9 @@ function syncDynamicAVReferenceInputs(node) {
         // next video socket. A soundtrack with an existing cable is also preserved
         // even if its video is temporarily disconnected, allowing the user to fix
         // the pair instead of silently losing the cable.
-        const highestVideo = highestConnectedIndex(node, REF_VIDEO_RE, MAX_VIDEO_REFS);
-        const visibleVideoMax = Math.min(MAX_VIDEO_REFS, Math.max(1, highestVideo + 1));
+        const desiredVideoSlots = desiredGlobalDynamicSlots(
+            node, runtime, REF_VIDEO_RE, MAX_VIDEO_REFS, "video"
+        );
 
         for (let i = 1; i <= MAX_VIDEO_REFS; i++) {
             const videoName = `ref_video_${i}`;
@@ -436,7 +640,7 @@ function syncDynamicAVReferenceInputs(node) {
             // Preserve the numbered video socket if one of its companion cables
             // is still connected, so dynamic cleanup never strands an FPS/audio
             // cable without a matching Video N socket.
-            if (i <= visibleVideoMax || videoIsConnected || companionConnected) {
+            if (desiredVideoSlots.has(i) || videoIsConnected || companionConnected) {
                 changed = addDynamicRefInput(
                     node,
                     videoName,
@@ -592,6 +796,7 @@ function newClip(index) {
         validated: false,
         color_adjustment: normalizeColorAdjustment(),
         loras: [],
+        local_refs: emptyLocalRefs(),
         first_frame: null,
         last_frame: null,
         guides: [],
@@ -613,6 +818,7 @@ function normalizeClipList(rawClips) {
         validated: Boolean(c?.validated),
         color_adjustment: normalizeColorAdjustment(c?.color_adjustment),
         loras: normalizeClipLoras(c?.loras, c?.lora),
+        local_refs: normalizeLocalRefs(c?.local_refs),
         first_frame: normalizeRefDescriptor(c?.first_frame),
         last_frame: normalizeRefDescriptor(c?.last_frame),
         guides: normalizeGuideList(c),
@@ -959,8 +1165,10 @@ async function discardComputedClip(node, runtime, clipIndex) {
             : (discardedCount > 1
                 ? `FL2VA clip ${index + 1} checkpoint discarded — ${discardedCount - 1} Previous-linked dependent clip(s) also decomputed`
                 : `FL2VA clip ${index + 1} checkpoint discarded — this plan will rerender`);
+        return true;
     } catch (error) {
         runtime.statusText = `Checkpoint discard failed: ${String(error?.message || error)}`;
+        return false;
     } finally {
         runtime.discardComputedBusy = false;
         render(node, runtime);
@@ -1589,10 +1797,14 @@ function handleReferenceChange(node, runtime, message = "Image references change
 
 function openReferenceEditor(node, runtime, slotIndex, ref, target = null) {
     if (!ref?.id || !node || !runtime) return;
-    const isFrame = Boolean(target && ["first", "last", "guide"].includes(String(target.kind)));
+    const targetKind = String(target?.kind || "");
+    const isFrame = Boolean(target && ["first", "last", "guide"].includes(targetKind));
+    const isLocalPicture = Boolean(target && targetKind === "local_picture");
     const frameClipIndex = isFrame ? Number(target.clipIndex) : -1;
-    const frameKind = isFrame ? String(target.kind) : "";
+    const frameKind = isFrame ? targetKind : "";
     const frameGuideIndex = frameKind === "guide" ? Number(target?.guideIndex) : -1;
+    const localClipIndex = isLocalPicture ? Number(target.clipIndex) : -1;
+    const localSlot = isLocalPicture ? Number(target.slot) : -1;
     const frameKindLabel = frameKind === "first"
         ? "First frame"
         : frameKind === "last"
@@ -1600,12 +1812,16 @@ function openReferenceEditor(node, runtime, slotIndex, ref, target = null) {
             : `Guide ${Number.isInteger(frameGuideIndex) && frameGuideIndex >= 0 ? frameGuideIndex + 1 : 1}`;
     const frameLabel = isFrame
         ? `Clip ${frameClipIndex + 1} ${frameKindLabel}`
-        : `Ref ${slotIndex + 1}`;
+        : isLocalPicture
+            ? `Clip ${localClipIndex + 1} Picture ${localSlot}`
+            : `Ref ${slotIndex + 1}`;
     const defaultName = isFrame
         ? (frameKind === "guide"
             ? `clip_${frameClipIndex + 1}_guide_${Math.max(0, frameGuideIndex) + 1}.png`
             : `clip_${frameClipIndex + 1}_${frameKind}.png`)
-        : `ref_${slotIndex + 1}.png`;
+        : isLocalPicture
+            ? `clip_${localClipIndex + 1}_picture_${localSlot}.png`
+            : `ref_${slotIndex + 1}.png`;
     if (projectBusy(runtime) || runtime.refBusy || runtime.projectOperationBusy) {
         alert("Wait for the current clip generation to finish before editing a reference image.");
         return;
@@ -1845,7 +2061,15 @@ function openReferenceEditor(node, runtime, slotIndex, ref, target = null) {
     };
     closeButton.addEventListener("click", close);
     cancel.addEventListener("click", close);
-    overlay.addEventListener("click", close);
+    // Treat this as an explicit dialog: clicking the dimmed background must
+    // not close it while the user is managing several references. Finish with
+    // the Validate button (or use the small × as a quick close).
+    overlay.addEventListener("click", (event) => {
+        if (event.target === overlay) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+    });
     panel.addEventListener("click", (event) => event.stopPropagation());
     window.addEventListener("keydown", onKey);
 
@@ -1888,11 +2112,20 @@ function openReferenceEditor(node, runtime, slotIndex, ref, target = null) {
             const newRef = normalizeRefDescriptor(payload.ref);
             if (!newRef) throw new Error("The backend returned invalid reference metadata.");
 
+            let localItem = null;
             const current = isFrame
                 ? (frameKind === "guide"
                     ? runtime.state?.clips?.[frameClipIndex]?.guides?.[frameGuideIndex]?.frame
                     : runtime.state?.clips?.[frameClipIndex]?.[`${frameKind}_frame`])
-                : runtime.refsState.refs[slotIndex];
+                : isLocalPicture
+                    ? (() => {
+                        const localClip = runtime.state?.clips?.[localClipIndex];
+                        if (!localClip) return null;
+                        localClip.local_refs = normalizeLocalRefs(localClip.local_refs);
+                        localItem = localClip.local_refs.images.find((item) => Number(item.slot) === Number(localSlot)) || null;
+                        return localItem?.ref || null;
+                    })()
+                    : runtime.refsState.refs[slotIndex];
             if (!current || String(current.id) !== String(ref.id)) {
                 throw new Error(`${frameLabel} changed while the editor was open.`);
             }
@@ -1910,6 +2143,29 @@ function openReferenceEditor(node, runtime, slotIndex, ref, target = null) {
                 runtime.statusText = sameRefContent(ref, newRef)
                     ? `${frameLabel} unchanged`
                     : `${frameLabel} adjusted | validations unchanged`;
+                render(node, runtime);
+            } else if (isLocalPicture) {
+                if (!localItem) throw new Error(`${frameLabel} changed while the editor was open.`);
+                const changed = !sameRefContent(ref, newRef);
+                if (changed && !(await prepareLocalRefMutation(node, runtime, localClipIndex))) {
+                    throw new Error(`${frameLabel} could not invalidate its clip cache.`);
+                }
+                // prepareLocalRefMutation may update runtime state while discarding a
+                // COMPUTED checkpoint, so resolve the row once more before commit.
+                const localClip = runtime.state?.clips?.[localClipIndex];
+                if (!localClip) throw new Error(`${frameLabel} changed while the editor was open.`);
+                localClip.local_refs = normalizeLocalRefs(localClip.local_refs);
+                const commitItem = localClip.local_refs.images.find((item) => Number(item.slot) === Number(localSlot));
+                if (!commitItem || String(commitItem.ref?.id || "") !== String(ref.id)) {
+                    throw new Error(`${frameLabel} changed while the editor was open.`);
+                }
+                commitItem.ref = newRef;
+                localClip.local_refs = normalizeLocalRefs(localClip.local_refs);
+                updateHidden(node, runtime);
+                captureNativeWorkflowState(node, runtime);
+                runtime.statusText = changed
+                    ? `${frameLabel} adjusted`
+                    : `${frameLabel} unchanged`;
                 render(node, runtime);
             } else {
                 runtime.refsState.refs[slotIndex] = newRef;
@@ -1942,6 +2198,12 @@ async function uploadReference(node, runtime, slotIndex, file) {
     if (!node || !runtime || !file) return;
     if (projectBusy(runtime)) {
         alert("Wait for the current clip generation to finish before changing a reference image.");
+        return;
+    }
+    const logicalSlot = Number(slotIndex) + 1;
+    if (localSlotReservations(runtime, "picture").has(logicalSlot)) {
+        alert(`Picture ${logicalSlot} is reserved by a clip-local reference. Remove the local reference first.`);
+        render(node, runtime);
         return;
     }
 
@@ -1981,6 +2243,396 @@ async function uploadReference(node, runtime, slotIndex, file) {
         runtime.refBusy = false;
         render(node, runtime);
     }
+}
+
+async function uploadLocalPicture(node, runtime, clipIndex, file) {
+    const clip = runtime?.state?.clips?.[clipIndex];
+    if (!clip || !file) return false;
+    const slot = firstFreeLocalSlot(node, runtime, clip, "picture");
+    if (slot === null) {
+        alert("No free Picture slot remains for this clip (global + local maximum is 9).");
+        return false;
+    }
+    runtime.refBusy = true;
+    runtime.statusText = `Loading local Picture ${slot} for Clip ${clipIndex + 1}…`;
+    render(node, runtime);
+    try {
+        const form = new FormData();
+        form.append("ref_file", file, file.name);
+        const response = await fetch(api.apiURL("/h3_extender/ref/upload"), { method: "POST", body: form });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok || !payload?.ref) {
+            throw new Error(payload?.error || `Local picture upload failed (${response.status}).`);
+        }
+        const ref = normalizeRefDescriptor(payload.ref);
+        if (!ref) throw new Error("Backend returned invalid local picture metadata.");
+        if (!(await prepareLocalRefMutation(node, runtime, clipIndex))) return false;
+        clip.local_refs = normalizeLocalRefs(clip.local_refs);
+        clip.local_refs.images.push({ slot, ref });
+        clip.local_refs = normalizeLocalRefs(clip.local_refs);
+        updateHidden(node, runtime);
+        captureNativeWorkflowState(node, runtime);
+        syncDynamicAVReferenceInputs(node, runtime);
+        runtime.statusText = `Clip ${clipIndex + 1}: local Picture ${slot} loaded`;
+        return true;
+    } catch (error) {
+        runtime.statusText = "Local picture load failed";
+        alert(String(error?.message || error));
+        return false;
+    } finally {
+        runtime.refBusy = false;
+        render(node, runtime);
+    }
+}
+
+async function uploadLocalMedia(node, runtime, clipIndex, kind, file) {
+    const clip = runtime?.state?.clips?.[clipIndex];
+    if (!clip || !file || !["video", "audio"].includes(kind)) return false;
+    const slot = firstFreeLocalSlot(node, runtime, clip, kind);
+    const label = kind === "video" ? "Video" : "Audio";
+    const limit = kind === "video" ? MAX_VIDEO_REFS : MAX_STANDALONE_AUDIO_REFS;
+    if (slot === null) {
+        alert(`No free ${label} slot remains for this clip (global + local maximum is ${limit}).`);
+        return false;
+    }
+    runtime.refBusy = true;
+    runtime.statusText = `Loading local ${label} ${slot} for Clip ${clipIndex + 1}…`;
+    render(node, runtime);
+    try {
+        const form = new FormData();
+        form.append("kind", kind);
+        form.append("media_file", file, file.name);
+        const response = await fetch(api.apiURL("/h3_extender/local_media/upload"), { method: "POST", body: form });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok || !payload?.media) {
+            throw new Error(payload?.error || `Local ${kind} upload failed (${response.status}).`);
+        }
+        const media = normalizeMediaDescriptor(payload.media, kind);
+        if (!media) throw new Error(`Backend returned invalid local ${kind} metadata.`);
+        if (!(await prepareLocalRefMutation(node, runtime, clipIndex))) return false;
+        clip.local_refs = normalizeLocalRefs(clip.local_refs);
+        const key = kind === "video" ? "videos" : "audios";
+        clip.local_refs[key].push({ slot, media });
+        clip.local_refs = normalizeLocalRefs(clip.local_refs);
+        updateHidden(node, runtime);
+        captureNativeWorkflowState(node, runtime);
+        syncDynamicAVReferenceInputs(node, runtime);
+        runtime.statusText = `Clip ${clipIndex + 1}: local ${label} ${slot} loaded`;
+        return true;
+    } catch (error) {
+        runtime.statusText = `Local ${kind} load failed`;
+        alert(String(error?.message || error));
+        return false;
+    } finally {
+        runtime.refBusy = false;
+        render(node, runtime);
+    }
+}
+
+async function removeLocalRef(node, runtime, clipIndex, kind, slot) {
+    const clip = runtime?.state?.clips?.[clipIndex];
+    if (!clip) return false;
+    if (!(await prepareLocalRefMutation(node, runtime, clipIndex))) return false;
+    const local = normalizeLocalRefs(clip.local_refs);
+    const key = kind === "picture" ? "images" : (kind === "video" ? "videos" : "audios");
+    local[key] = local[key].filter((item) => Number(item.slot) !== Number(slot));
+    clip.local_refs = normalizeLocalRefs(local);
+    updateHidden(node, runtime);
+    captureNativeWorkflowState(node, runtime);
+    syncDynamicAVReferenceInputs(node, runtime);
+    runtime.statusText = `Clip ${clipIndex + 1}: local ${kind} ${slot} removed`;
+    render(node, runtime);
+    return true;
+}
+
+function openLocalRefsPanel(node, runtime, clipIndex) {
+    const clip = runtime?.state?.clips?.[clipIndex];
+    if (!clip || String(runtime.state?.generation_mode || "ref2va") !== "ref2va") return;
+    if (projectBusy(runtime) || runtime.refBusy || runtime.projectOperationBusy) return;
+    clip.local_refs = normalizeLocalRefs(clip.local_refs);
+
+    // Only one local-refs manager should be open at a time.
+    try {
+        runtime.localRefsPanel?.overlay?.remove();
+    } catch (_) {}
+
+    const overlay = document.createElement("div");
+    overlay.style.position = "fixed";
+    overlay.style.inset = "0";
+    overlay.style.zIndex = "100000";
+    overlay.style.background = "rgba(0,0,0,.70)";
+    overlay.style.display = "flex";
+    overlay.style.alignItems = "center";
+    overlay.style.justifyContent = "center";
+    overlay.style.padding = "20px";
+    overlay.style.boxSizing = "border-box";
+
+    const panel = document.createElement("div");
+    panel.style.width = "min(620px, 94vw)";
+    panel.style.maxHeight = "86vh";
+    panel.style.overflow = "auto";
+    panel.style.background = "#1a1a1a";
+    panel.style.border = "1px solid rgba(255,255,255,.18)";
+    panel.style.borderRadius = "10px";
+    panel.style.boxShadow = "0 18px 60px rgba(0,0,0,.65)";
+    panel.style.padding = "14px";
+    panel.style.boxSizing = "border-box";
+    overlay.appendChild(panel);
+
+    const close = () => {
+        if (runtime.localRefsPanel?.overlay === overlay) runtime.localRefsPanel = null;
+        overlay.remove();
+    };
+    // Treat this as an explicit dialog: clicking the dimmed background must
+    // not close it while the user is managing several references. Finish with
+    // the Validate button (or use the small × as a quick close).
+    overlay.addEventListener("click", (event) => {
+        if (event.target === overlay) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+    });
+    panel.addEventListener("click", (event) => event.stopPropagation());
+
+    const renderContents = () => {
+        const liveClip = runtime?.state?.clips?.[clipIndex];
+        if (!liveClip) {
+            close();
+            return;
+        }
+        liveClip.local_refs = normalizeLocalRefs(liveClip.local_refs);
+        panel.replaceChildren();
+
+        const header = document.createElement("div");
+        header.style.display = "flex";
+        header.style.alignItems = "center";
+        header.style.justifyContent = "space-between";
+        header.style.gap = "10px";
+        const title = document.createElement("strong");
+        title.textContent = `Local References — Clip ${clipIndex + 1}`;
+        const closeBtn = document.createElement("button");
+        closeBtn.textContent = "×";
+        closeBtn.style.width = "28px";
+        closeBtn.style.height = "26px";
+        closeBtn.style.padding = "0";
+        closeBtn.addEventListener("click", close);
+        header.append(title, closeBtn);
+        panel.appendChild(header);
+
+        const occupied = globalReferenceOccupancy(node, runtime);
+        const conflicts = localRefsConflictSummary(node, runtime, liveClip);
+        const summary = document.createElement("div");
+        summary.style.fontSize = "11px";
+        summary.style.lineHeight = "1.45";
+        summary.style.opacity = ".78";
+        summary.style.margin = "8px 0 12px";
+        summary.textContent =
+            `${occupied.pictures.size} global Picture(s) • ${occupied.videos.size} global Video(s) • ${occupied.audios.size} global Audio slot(s). ` +
+            `Local refs take the first free logical slot; that same global slot is locked while any clip uses it locally. Global refs remain active on every clip. Mixed H3 limit: ${MAX_MIXED_REFS}.`;
+        panel.appendChild(summary);
+
+        if (conflicts.length) {
+            const warning = document.createElement("div");
+            warning.textContent = `⚠ Global/local slot conflict: ${conflicts.join(", ")}. Local references have priority; the conflicting global slot is ignored for this clip.`;
+            warning.style.padding = "7px 9px";
+            warning.style.marginBottom = "10px";
+            warning.style.borderRadius = "6px";
+            warning.style.background = "rgba(180,70,40,.28)";
+            warning.style.fontSize = "11px";
+            panel.appendChild(warning);
+        }
+
+        const makePicker = (accept, handler) => {
+            const input = document.createElement("input");
+            input.type = "file";
+            input.accept = accept;
+            input.style.display = "none";
+            input.addEventListener("change", async () => {
+                const file = input.files?.[0];
+                if (!file) return;
+                // Keep the manager open while the upload/mutation happens.
+                // Reset the picker so selecting the same file again still fires.
+                input.value = "";
+                const changed = await handler(file);
+                if (changed && overlay.isConnected) renderContents();
+            });
+            panel.appendChild(input);
+            return input;
+        };
+        const picInput = makePicker("image/*", (file) => uploadLocalPicture(node, runtime, clipIndex, file));
+        const vidInput = makePicker("video/*,.mp4,.mov,.mkv,.webm,.avi", (file) => uploadLocalMedia(node, runtime, clipIndex, "video", file));
+        const audInput = makePicker("audio/*,.wav,.mp3,.flac,.m4a,.aac,.ogg", (file) => uploadLocalMedia(node, runtime, clipIndex, "audio", file));
+
+        const buttonRow = document.createElement("div");
+        buttonRow.style.display = "grid";
+        buttonRow.style.gridTemplateColumns = "1fr 1fr 1fr";
+        buttonRow.style.gap = "7px";
+        buttonRow.style.marginBottom = "12px";
+        const addButton = (label, kind, input) => {
+            const b = document.createElement("button");
+            b.textContent = label;
+            b.disabled = firstFreeLocalSlot(node, runtime, liveClip, kind) === null;
+            b.title = b.disabled ? `No free ${kind} slot remains` : `Add one clip-local ${kind} reference`;
+            b.addEventListener("click", () => input.click());
+            return b;
+        };
+        buttonRow.append(
+            addButton("+ Picture", "picture", picInput),
+            addButton("+ Video", "video", vidInput),
+            addButton("+ Audio", "audio", audInput),
+        );
+        panel.appendChild(buttonRow);
+
+        const local = normalizeLocalRefs(liveClip.local_refs);
+        const rows = [
+            ...local.images.map((item) => ({ kind: "picture", slot: item.slot, payload: item.ref })),
+            ...local.videos.map((item) => ({ kind: "video", slot: item.slot, payload: item.media })),
+            ...local.audios.map((item) => ({ kind: "audio", slot: item.slot, payload: item.media })),
+        ].sort((a, b) => a.kind.localeCompare(b.kind) || a.slot - b.slot);
+
+        if (!rows.length) {
+            const empty = document.createElement("div");
+            empty.textContent = "No local references on this clip.";
+            empty.style.padding = "16px 4px";
+            empty.style.opacity = ".55";
+            empty.style.fontSize = "11px";
+            panel.appendChild(empty);
+        }
+
+        for (const row of rows) {
+            const line = document.createElement("div");
+            line.style.display = "grid";
+            line.style.gridTemplateColumns = row.kind === "picture"
+                ? "52px minmax(0,1fr) 28px"
+                : "minmax(0,1fr) 28px";
+            line.style.gap = "7px";
+            line.style.alignItems = "center";
+            line.style.padding = "7px 0";
+            line.style.borderTop = "1px solid rgba(255,255,255,.08)";
+
+            if (row.kind === "picture") {
+                const thumb = document.createElement("img");
+                thumb.src = refImageUrl(row.payload);
+                thumb.alt = `Clip ${clipIndex + 1} Picture ${row.slot}`;
+                thumb.title = `Picture ${row.slot} — double-click to edit`;
+                thumb.style.width = "48px";
+                thumb.style.height = "38px";
+                thumb.style.objectFit = "contain";
+                thumb.style.background = "rgba(0,0,0,.25)";
+                thumb.style.borderRadius = "4px";
+                thumb.style.cursor = "pointer";
+                thumb.draggable = false;
+                thumb.addEventListener("dblclick", (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    close();
+                    openReferenceEditor(node, runtime, -1, row.payload, {
+                        kind: "local_picture",
+                        clipIndex,
+                        slot: row.slot,
+                    });
+                });
+                line.appendChild(thumb);
+
+                const label = document.createElement("strong");
+                label.style.fontSize = "11px";
+                label.textContent = `Picture ${row.slot}`;
+                line.appendChild(label);
+            } else {
+                const mediaCell = document.createElement("div");
+                mediaCell.style.minWidth = "0";
+                mediaCell.style.display = "flex";
+                mediaCell.style.flexDirection = "column";
+                mediaCell.style.gap = "5px";
+
+                const mediaHeader = document.createElement("div");
+                mediaHeader.style.display = "flex";
+                mediaHeader.style.alignItems = "baseline";
+                mediaHeader.style.justifyContent = "space-between";
+                mediaHeader.style.gap = "8px";
+
+                const label = document.createElement("strong");
+                label.style.fontSize = "11px";
+                label.textContent = `${row.kind === "video" ? "Video" : "Audio"} ${row.slot}`;
+                mediaHeader.appendChild(label);
+
+                const dur = Number(row.payload?.duration || 0);
+                if (dur > 0) {
+                    const meta = document.createElement("span");
+                    meta.textContent = `${dur.toFixed(1)} s`;
+                    meta.style.fontSize = "10px";
+                    meta.style.opacity = ".65";
+                    mediaHeader.appendChild(meta);
+                }
+                mediaCell.appendChild(mediaHeader);
+
+                const src = localMediaPreviewUrl(row.payload);
+                if (row.kind === "video") {
+                    const player = document.createElement("video");
+                    player.src = src;
+                    player.controls = true;
+                    player.preload = "metadata";
+                    player.playsInline = true;
+                    player.style.display = "block";
+                    player.style.width = "100%";
+                    player.style.maxHeight = "150px";
+                    player.style.objectFit = "contain";
+                    player.style.background = "#080808";
+                    player.style.borderRadius = "6px";
+                    player.title = `Video ${row.slot}`;
+                    mediaCell.appendChild(player);
+                } else {
+                    const player = document.createElement("audio");
+                    player.src = src;
+                    player.controls = true;
+                    player.preload = "metadata";
+                    player.style.display = "block";
+                    player.style.width = "100%";
+                    player.style.height = "32px";
+                    player.title = `Audio ${row.slot}`;
+                    mediaCell.appendChild(player);
+                }
+                line.appendChild(mediaCell);
+            }
+
+            const remove = document.createElement("button");
+            remove.textContent = "×";
+            remove.title = "Remove local reference";
+            remove.style.width = "28px";
+            remove.style.height = "24px";
+            remove.style.padding = "0";
+            remove.addEventListener("click", async () => {
+                remove.disabled = true;
+                const changed = await removeLocalRef(node, runtime, clipIndex, row.kind, row.slot);
+                if (changed && overlay.isConnected) renderContents();
+                else remove.disabled = false;
+            });
+            line.appendChild(remove);
+            panel.appendChild(line);
+        }
+
+        const footer = document.createElement("div");
+        footer.style.display = "flex";
+        footer.style.justifyContent = "flex-end";
+        footer.style.gap = "8px";
+        footer.style.marginTop = "14px";
+        footer.style.paddingTop = "12px";
+        footer.style.borderTop = "1px solid rgba(255,255,255,.10)";
+
+        const validateBtn = document.createElement("button");
+        validateBtn.type = "button";
+        validateBtn.textContent = "Validate";
+        validateBtn.style.minWidth = "96px";
+        validateBtn.style.height = "30px";
+        validateBtn.style.fontWeight = "600";
+        validateBtn.addEventListener("click", close);
+        footer.appendChild(validateBtn);
+        panel.appendChild(footer);
+    };
+
+    document.body.appendChild(overlay);
+    runtime.localRefsPanel = { overlay, clipIndex, refresh: renderContents, close };
+    renderContents();
 }
 
 async function uploadClipFrame(node, runtime, clipIndex, kind, file, guideIndex = -1) {
@@ -2754,9 +3406,12 @@ function renderReferences(node, runtime) {
     row.replaceChildren();
 
     const refs = runtime.refsState?.refs || [];
+    const locallyReservedPictures = localSlotReservations(runtime, "picture");
 
     for (let index = 0; index < MAX_IMAGE_REFS; index++) {
         const ref = refs[index] || null;
+        const logicalSlot = index + 1;
+        const reservedByLocal = locallyReservedPictures.has(logicalSlot);
         const slot = document.createElement("div");
         // Fill the whole available node width with nine equal reference slots.
         // REF_SLOT_WIDTH is a hard minimum for each slot, not for the node.
@@ -2768,17 +3423,25 @@ function renderReferences(node, runtime) {
         slot.style.position = "relative";
 
         const load = document.createElement("button");
-        load.textContent = ref ? `Replace Ref ${index + 1}` : `Load Ref ${index + 1}`;
-        load.title = ref
-            ? `Replace Ref ${index + 1}: ${ref.original_name || "reference"}`
-            : `Load image reference ${index + 1}`;
+        load.textContent = reservedByLocal && !ref
+            ? `Ref ${logicalSlot} — Local`
+            : (ref ? `Replace Ref ${logicalSlot}` : `Load Ref ${logicalSlot}`);
+        load.title = reservedByLocal
+            ? `Picture ${logicalSlot} is reserved by one or more clip-local references`
+            : (ref
+                ? `Replace Ref ${logicalSlot}: ${ref.original_name || "reference"}`
+                : `Load image reference ${logicalSlot}`);
         load.style.width = "100%";
         load.style.height = "23px";
         load.style.padding = "2px 4px";
         load.style.fontSize = "10px";
         load.disabled = Boolean(
-            runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime)
+            reservedByLocal || runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime)
         );
+        if (reservedByLocal) {
+            load.style.opacity = ".38";
+            load.style.cursor = "not-allowed";
+        }
         load.addEventListener("click", (event) => {
             event.preventDefault();
             if (load.disabled) return;
@@ -2840,9 +3503,13 @@ function renderReferences(node, runtime) {
             thumb.appendChild(remove);
         } else {
             const empty = document.createElement("span");
-            empty.textContent = "+";
-            empty.style.fontSize = "24px";
-            empty.style.opacity = ".55";
+            empty.textContent = reservedByLocal ? "LOCAL" : "+";
+            empty.style.fontSize = reservedByLocal ? "10px" : "24px";
+            empty.style.fontWeight = reservedByLocal ? "700" : "400";
+            empty.style.letterSpacing = reservedByLocal ? ".06em" : "normal";
+            empty.style.opacity = reservedByLocal ? ".38" : ".55";
+            thumb.style.opacity = reservedByLocal ? ".5" : "1";
+            thumb.style.borderStyle = reservedByLocal ? "dashed" : "solid";
             thumb.appendChild(empty);
         }
         slot.appendChild(thumb);
@@ -2856,9 +3523,11 @@ function renderReferences(node, runtime) {
         meta.style.whiteSpace = "nowrap";
         meta.style.overflow = "hidden";
         meta.style.textOverflow = "ellipsis";
-        meta.textContent = ref && ref.width > 0 && ref.height > 0
-            ? `${Math.trunc(ref.width)}×${Math.trunc(ref.height)}`
-            : "empty";
+        meta.textContent = reservedByLocal && !ref
+            ? "local slot"
+            : (ref && ref.width > 0 && ref.height > 0
+                ? `${Math.trunc(ref.width)}×${Math.trunc(ref.height)}`
+                : "empty");
         meta.title = ref?.original_name || "";
         slot.appendChild(meta);
 
@@ -3331,6 +4000,32 @@ function render(node, runtime) {
             st === "cached" ? "CACHE" : "○";
 
         head.append(title, name, colorWrap, badge);
+        if (!fl2vaMode) {
+            clip.local_refs = normalizeLocalRefs(clip.local_refs);
+            const localCount = localRefCount(clip);
+            const localConflicts = localRefsConflictSummary(node, runtime, clip);
+            const refsButton = document.createElement("button");
+            refsButton.type = "button";
+            refsButton.textContent = `Refs ${localCount}`;
+            refsButton.title = localConflicts.length
+                ? `Local/global slot conflict: ${localConflicts.join(", ")}`
+                : "Manage clip-local Picture / Video / Audio references";
+            refsButton.style.height = "22px";
+            refsButton.style.padding = "0 6px";
+            refsButton.style.fontSize = "10px";
+            refsButton.style.whiteSpace = "nowrap";
+            if (localConflicts.length) {
+                refsButton.style.borderColor = "rgba(255,115,70,.95)";
+                refsButton.style.color = "#ffb39c";
+            }
+            refsButton.disabled = Boolean(runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime));
+            refsButton.addEventListener("click", (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (!refsButton.disabled) openLocalRefsPanel(node, runtime, index);
+            });
+            head.appendChild(refsButton);
+        }
         if (fl2vaMode) {
             const insertButton = document.createElement("button");
             insertButton.type = "button";
@@ -4062,7 +4757,7 @@ function hydrateRuntimeFromNativeWidgets(node, runtime, restoreCache = false) {
     runtime.validatedCount = restoredValidatedPrefix;
 
     const removedLegacyRefs = removeLegacyImageRefInputs(node);
-    syncDynamicAVReferenceInputs(node);
+    syncDynamicAVReferenceInputs(node, runtime);
     if (removedLegacyRefs && refCount(runtime) === 0) {
         runtime.statusText = "Legacy image-ref sockets removed — load references in the Extender";
     }
@@ -4676,9 +5371,15 @@ app.registerExtension({
             const slots = Array.isArray(detail?.imported_slots)
                 ? detail.imported_slots.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1 && value <= MAX_IMAGE_REFS)
                 : [];
+            const skipped = Array.isArray(detail?.skipped_slots)
+                ? detail.skipped_slots.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1 && value <= MAX_IMAGE_REFS)
+                : [];
             const source = String(detail?.source || "External reference pack");
-            runtime.statusText = slots.length
-                ? `${source}: imported Ref ${slots.join(", ")} into internal slots`
+            const parts = [];
+            if (slots.length) parts.push(`imported Ref ${slots.join(", ")}`);
+            if (skipped.length) parts.push(`ignored local-reserved Ref ${skipped.join(", ")}`);
+            runtime.statusText = parts.length
+                ? `${source}: ${parts.join(" • ")}`
                 : `${source}: synchronized`;
             render(node, runtime);
             node.graph?.setDirtyCanvas(true, true);
